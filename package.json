@@ -1,0 +1,18 @@
+{
+  "name": "infinity-ocean",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --port 9191"
+  },
+  "dependencies": {
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.187.0",
+    "typescript": "~5.9.0",
+    "vite": "^8.3.0"
+  }
+}

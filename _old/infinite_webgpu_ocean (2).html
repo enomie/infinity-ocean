@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Three.js WebGPU Infinite Ocean & Floating Boat</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background-color: #030813;
+      user-select: none;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+    .hud-panel {
+      background: rgba(10, 20, 38, 0.72);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+  </style>
+  <!-- Import Map for latest Three.js WebGPU and TSL modules -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.174.0/build/three.webgpu.js",
+        "three/webgpu": "https://unpkg.com/three@0.174.0/build/three.webgpu.js",
+        "three/tsl": "https://unpkg.com/three@0.174.0/build/three.tsl.js",
+        "three/addons/": "https://unpkg.com/three@0.174.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body class="relative">
+
+  <!-- HUD overlay -->
+  <div class="absolute top-4 left-4 z-20 pointer-events-none flex flex-col gap-2">
+    <div class="hud-panel p-4 rounded-xl text-white shadow-2xl max-w-sm pointer-events-auto transition-all">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
+        <h1 class="text-sm font-semibold tracking-wide uppercase text-cyan-200">Three.js WebGPU Ocean</h1>
+      </div>
+      <p class="text-xs text-slate-300 leading-relaxed mb-3">
+        Klicke auf das Wasser für langsame Solitärwellen. Steuere das Boot mit <strong class="text-cyan-300">WASD</strong> – es erzeugt Vorwärtsschub, Ruder-Dynamik und eine echte Wellenspur.
+      </p>
+      <div class="grid grid-cols-2 gap-2 text-[11px] text-slate-400 border-t border-slate-700/60 pt-2.5">
+        <div><span class="text-cyan-200 font-medium font-mono">WASD:</span> Boot fahren</div>
+        <div><span class="text-slate-200 font-medium">Linksklick:</span> Welle senden</div>
+        <div><span class="text-slate-200 font-medium">Rechts/Drag:</span> Orbit Kamera</div>
+        <div id="boatSpeed" class="text-emerald-300 font-mono">Speed: 0.0 kn</div>
+        <div id="waveCounter" class="text-cyan-300 font-mono col-span-2">Wellen aktiv: 0</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fallback / Status banner -->
+  <div id="statusBadge" class="absolute bottom-4 left-4 z-20 px-3 py-1.5 rounded-lg hud-panel text-[11px] text-slate-300 pointer-events-none flex items-center gap-2">
+    <span id="backendIndicator" class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+    <span id="backendText">Initializing Renderer...</span>
+  </div>
+
+  <!-- Main Three.js Container -->
+  <div id="canvas-container" class="w-full h-full"></div>
+
+  <script type="module">
+    import * as THREE from 'three/webgpu';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // --- State & Constants ---
+    const MAX_CLICKS = 12;
+    const clickData = [];
+    for (let i = 0; i < MAX_CLICKS; i++) {
+      clickData.push({ x: 0, z: 0, time: -999.0, amp: 0 });
+    }
+    let clickIndex = 0;
+
+    // Wake waves ring-buffer (generated continuously behind the stern)
+    const MAX_WAKES = 20;
+    const wakeData = [];
+    for (let i = 0; i < MAX_WAKES; i++) {
+      wakeData.push({ x: 0, z: 0, time: -999.0, amp: 0, heading: 0 });
+    }
+    let wakeIndex = 0;
+
+    // Keyboard Input State
+    const keys = { w: false, a: false, s: false, d: false };
+    window.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (keys.hasOwnProperty(k)) {
+        keys[k] = true;
+        // Prevent scroll on space/arrows if any
+        if (['w','a','s','d'].includes(k)) e.preventDefault();
+      }
+    });
+    window.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (keys.hasOwnProperty(k)) keys[k] = false;
+    });
+
+    // Gerstner wave parameter set (tuned for oceanic swell)
+    const waveParams = [
+      { dirX: 1.0, dirZ: 0.2, length: 32.0, amp: 0.75, speed: 1.1, steepness: 0.45 },
+      { dirX: -0.6, dirZ: 0.8, length: 18.0, amp: 0.45, speed: 1.4, steepness: 0.35 },
+      { dirX: 0.2, dirZ: -0.9, length: 11.0, amp: 0.25, speed: 1.8, steepness: 0.25 },
+      { dirX: 0.8, dirZ: -0.5, length: 6.0, amp: 0.12, speed: 2.2, steepness: 0.15 }
+    ];
+
+    // Compute frequency and wave vectors
+    waveParams.forEach(w => {
+      const len = Math.hypot(w.dirX, w.dirZ);
+      w.dirX /= len;
+      w.dirZ /= len;
+      w.k = (2.0 * Math.PI) / w.length;
+      w.w = Math.sqrt(9.81 * w.k) * w.speed;
+    });
+
+    // CPU analytical water calculation (for physics and CPU mirror)
+    function getWaterDisplacement(x, z, time, isFar = false) {
+      let dx = 0.0, dy = 0.0, dz = 0.0;
+
+      // 1. Gerstner swell summation (for distant ocean, evaluate main swells smoothly)
+      const count = isFar ? 2 : waveParams.length;
+      for (let i = 0; i < count; i++) {
+        const w = waveParams[i];
+        const phase = w.k * (w.dirX * x + w.dirZ * z) - w.w * time;
+        const cosP = Math.cos(phase);
+        const sinP = Math.sin(phase);
+        const qi = w.steepness / (w.k * w.amp * waveParams.length);
+
+        if (!isFar) {
+          dx += qi * w.amp * w.dirX * cosP;
+          dz += qi * w.amp * w.dirZ * cosP;
+        }
+        dy += w.amp * sinP;
+      }
+
+      // 2. Interactive Circular Click Waves (single solitary Gaussian ring)
+      const rippleSpeed = 3.2; // expansion speed in m/s
+      const rippleDecayTime = 16.0;
+      const waveWidth = 3.2;
+
+      for (let i = 0; i < MAX_CLICKS; i++) {
+        const c = clickData[i];
+        const dt = time - c.time;
+        if (dt > 0.0 && dt < rippleDecayTime) {
+          const rx = x - c.x;
+          const rz = z - c.z;
+          const dist = Math.hypot(rx, rz);
+          const waveFront = rippleSpeed * dt;
+          const distDiff = dist - waveFront;
+
+          // Solitary Gaussian pulse: rises smoothly then drops once
+          if (Math.abs(distDiff) < waveWidth * 2.5) {
+            const bell = Math.exp(-Math.pow(distDiff / waveWidth, 2.0));
+            const timeFade = Math.max(0.0, 1.0 - (dt / rippleDecayTime));
+            const distFade = 1.0 / Math.sqrt(Math.max(1.0, dist * 0.35));
+            dy += c.amp * bell * timeFade * distFade;
+          }
+        }
+      }
+
+      // 3. Dynamic Boat Stern Wake Waves (V-shaped propagating crests)
+      const wakeSpeed = 2.4;
+      const wakeDecay = 7.0;
+      for (let i = 0; i < MAX_WAKES; i++) {
+        const w = wakeData[i];
+        const dt = time - w.time;
+        if (dt > 0.0 && dt < wakeDecay) {
+          const rx = x - w.x;
+          const rz = z - w.z;
+          const dist = Math.hypot(rx, rz);
+          const front = wakeSpeed * dt;
+          const diff = Math.abs(dist - front);
+          if (diff < 1.8) {
+            const shape = Math.exp(-Math.pow(diff / 0.9, 2.0));
+            const fade = Math.max(0.0, 1.0 - (dt / wakeDecay));
+            // Slight lateral V-profile emphasis
+            dy += w.amp * shape * fade * (1.2 / Math.sqrt(Math.max(1.0, dist * 0.8)));
+          }
+        }
+      }
+
+      return { x: x + dx, y: dy, z: z + dz };
+    }
+
+    // Fast height-only query
+    function getWaterHeightAt(x, z, time) {
+      return getWaterDisplacement(x, z, time).y;
+    }
+
+    // Normal approximation using finite differences
+    function getWaterNormalAt(x, z, time) {
+      const eps = 0.2;
+      const hL = getWaterHeightAt(x - eps, z, time);
+      const hR = getWaterHeightAt(x + eps, z, time);
+      const hD = getWaterHeightAt(x, z - eps, time);
+      const hU = getWaterHeightAt(x, z + eps, time);
+
+      const normal = new THREE.Vector3(hL - hR, 2.0 * eps, hD - hU);
+      return normal.normalize();
+    }
+
+    // --- Renderer & Scene Initialization ---
+    let renderer, scene, camera, controls;
+    let oceanMesh, boatGroup, boatBody;
+    let sunLight, ambientLight;
+    let reflectorCamera, reflectionRenderTarget;
+    const container = document.getElementById('canvas-container');
+
+    async function init() {
+      // 1. WebGPU Renderer
+      try {
+        renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.05;
+        container.appendChild(renderer.domElement);
+        await renderer.init();
+        document.getElementById('backendText').innerText = 'WebGPU Active (High Performance)';
+      } catch (err) {
+        console.warn('WebGPU init fallback:', err);
+        // Fallback gracefully
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+        document.getElementById('backendIndicator').className = 'inline-block w-2 h-2 rounded-full bg-amber-400';
+        document.getElementById('backendText').innerText = 'WebGL Compatible Mode';
+      }
+
+      scene = new THREE.Scene();
+      const horizonColor = new THREE.Color(0x0a192e);
+      scene.background = horizonColor;
+      // Exponential fog precisely matching sky and water horizon for an infinite seamless view
+      scene.fog = new THREE.FogExp2(horizonColor, 0.0016);
+
+      camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.2, 3500);
+      camera.position.set(0, 6, 17);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.06;
+      controls.maxPolarAngle = Math.PI / 2 - 0.015; // Keep camera above water
+      controls.minDistance = 2.5;
+      controls.maxDistance = 350;
+      controls.target.set(0, 0, 0);
+
+      // 2. Lighting & Atmospheric Sun
+      ambientLight = new THREE.AmbientLight(0x40658a, 0.95);
+      scene.add(ambientLight);
+
+      sunLight = new THREE.DirectionalLight(0xfff1dc, 3.4);
+      sunLight.position.set(220, 160, -280);
+      scene.add(sunLight);
+
+      // Visual Sun Disc in sky
+      const sunGeo = new THREE.SphereGeometry(28, 32, 32);
+      const sunMat = new THREE.MeshBasicMaterial({ color: 0xfffae0 });
+      const sunMesh = new THREE.Mesh(sunGeo, sunMat);
+      sunMesh.position.copy(sunLight.position).multiplyScalar(4.0);
+      scene.add(sunMesh);
+
+      // Expansive Sky Dome seamlessly blending with horizon
+      const skyGeo = new THREE.SphereGeometry(2400, 32, 24);
+      const skyMat = new THREE.MeshBasicMaterial({
+        color: 0x091424,
+        side: THREE.BackSide
+      });
+      const skyDome = new THREE.Mesh(skyGeo, skyMat);
+      scene.add(skyDome);
+
+      // 3. Planar Reflection Setup
+      const reflectionWidth = Math.floor(window.innerWidth / 2);
+      const reflectionHeight = Math.floor(window.innerHeight / 2);
+      reflectionRenderTarget = new THREE.RenderTarget(reflectionWidth, reflectionHeight, {
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        format: THREE.RGBAFormat
+      });
+      reflectorCamera = new THREE.PerspectiveCamera();
+
+      // 4. Infinite Ocean Grid Creation
+      setupOcean();
+
+      // 5. Stylized Box Boat
+      setupBoat();
+
+      // 6. Interaction Events
+      window.addEventListener('resize', onWindowResize);
+      window.addEventListener('pointerdown', onPointerDown);
+
+      // 7. Start Game Loop
+      requestAnimationFrame(animate);
+    }
+
+    // --- Ocean Mesh & Dynamic Geometry Update ---
+    let oceanGeometry;
+    let oceanPositionsOrig;
+    let oceanMaterial;
+    let distantOuterOcean;
+    let outerPositionsOrig;
+    const GRID_SIZE = 340;        // High-density interactive inner sea
+    const GRID_SEGMENTS = 180;
+
+    function setupOcean() {
+      // 1. High-detail animated center grid
+      oceanGeometry = new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE, GRID_SEGMENTS, GRID_SEGMENTS);
+      oceanGeometry.rotateX(-Math.PI / 2);
+      oceanPositionsOrig = oceanGeometry.attributes.position.clone();
+
+      oceanMaterial = new THREE.MeshStandardMaterial({
+        color: 0x072138,
+        roughness: 0.1,
+        metalness: 0.28,
+        flatShading: false,
+        envMap: reflectionRenderTarget.texture,
+        envMapIntensity: 1.5
+      });
+
+      oceanMesh = new THREE.Mesh(oceanGeometry, oceanMaterial);
+      oceanMesh.position.set(0, 0, 0);
+      scene.add(oceanMesh);
+
+      // 2. Far Ocean Ring: Also animated with swell all the way to 2400m fog horizon!
+      const outerRingGeo = new THREE.RingGeometry(GRID_SIZE * 0.47, 2400, 90, 24);
+      outerRingGeo.rotateX(-Math.PI / 2);
+      outerPositionsOrig = outerRingGeo.attributes.position.clone();
+
+      const outerRingMat = new THREE.MeshStandardMaterial({
+        color: 0x072138,
+        roughness: 0.18,
+        metalness: 0.2,
+        envMap: reflectionRenderTarget.texture,
+        envMapIntensity: 1.2
+      });
+      distantOuterOcean = new THREE.Mesh(outerRingGeo, outerRingMat);
+      distantOuterOcean.position.set(0, 0, 0);
+      scene.add(distantOuterOcean);
+    }
+
+    // --- Stylized Box Boat Creation with Heavy Lead Keel ---
+    function setupBoat() {
+      boatGroup = new THREE.Group();
+
+      // Hull: Stylized beveled box
+      const hullGeo = new THREE.BoxGeometry(2.4, 0.9, 4.4);
+      const hullMat = new THREE.MeshStandardMaterial({
+        color: 0xd9532f, // Vibrant rescue orange
+        roughness: 0.35,
+        metalness: 0.15
+      });
+      boatBody = new THREE.Mesh(hullGeo, hullMat);
+      boatBody.castShadow = true;
+      boatBody.receiveShadow = true;
+      boatGroup.add(boatBody);
+
+      // --- BLEIKIEL (Heavy Keel Fin & Ballast Bulb) ---
+      // Keel fin extending deep underwater
+      const keelFinGeo = new THREE.BoxGeometry(0.12, 1.2, 1.4);
+      const keelMat = new THREE.MeshStandardMaterial({
+        color: 0x2b333e, // Dark lead finish
+        metalness: 0.85,
+        roughness: 0.25
+      });
+      const keelFin = new THREE.Mesh(keelFinGeo, keelMat);
+      keelFin.position.set(0, -0.9, 0);
+      boatGroup.add(keelFin);
+
+      // Torpedo-shaped lead bulb at the bottom for low center of gravity
+      const bulbGeo = new THREE.CylinderGeometry(0.24, 0.24, 2.0, 16);
+      bulbGeo.rotateX(Math.PI / 2);
+      const bulbMat = new THREE.MeshStandardMaterial({
+        color: 0x1f242c,
+        metalness: 0.95,
+        roughness: 0.2
+      });
+      const keelBulb = new THREE.Mesh(bulbGeo, bulbMat);
+      keelBulb.position.set(0, -1.5, 0);
+      boatGroup.add(keelBulb);
+
+      // Cabin / Bridge
+      const cabinGeo = new THREE.BoxGeometry(1.6, 0.75, 1.8);
+      const cabinMat = new THREE.MeshStandardMaterial({
+        color: 0xf5f7fa, // Clean white
+        roughness: 0.25,
+        metalness: 0.1
+      });
+      const cabin = new THREE.Mesh(cabinGeo, cabinMat);
+      cabin.position.set(0, 0.75, -0.3);
+      boatGroup.add(cabin);
+
+      // Windows
+      const winGeo = new THREE.BoxGeometry(1.65, 0.3, 1.0);
+      const winMat = new THREE.MeshStandardMaterial({
+        color: 0x112233,
+        roughness: 0.05,
+        metalness: 0.9
+      });
+      const windows = new THREE.Mesh(winGeo, winMat);
+      windows.position.set(0, 0.85, -0.3);
+      boatGroup.add(windows);
+
+      // Chimney / Exhaust pipe
+      const chimneyGeo = new THREE.CylinderGeometry(0.18, 0.18, 0.8, 16);
+      const chimneyMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 });
+      const chimney = new THREE.Mesh(chimneyGeo, chimneyMat);
+      chimney.position.set(0, 1.35, -0.9);
+      boatGroup.add(chimney);
+
+      // Mast / Antenna
+      const mastGeo = new THREE.CylinderGeometry(0.04, 0.04, 1.4, 8);
+      const mastMat = new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.8 });
+      const mast = new THREE.Mesh(mastGeo, mastMat);
+      mast.position.set(0, 1.6, 0.4);
+      boatGroup.add(mast);
+
+      // Small flag atop mast
+      const flagGeo = new THREE.BoxGeometry(0.02, 0.25, 0.4);
+      const flagMat = new THREE.MeshStandardMaterial({ color: 0x2563eb });
+      const flag = new THREE.Mesh(flagGeo, flagMat);
+      flag.position.set(0, 2.15, 0.2);
+      boatGroup.add(flag);
+
+      boatGroup.position.set(0, 0, 0);
+      scene.add(boatGroup);
+    }
+
+    // --- Interactive Ripple Spawning on Pointer Click ---
+    const raycaster = new THREE.Raycaster();
+    const mouseNDC = new THREE.Vector2();
+    const waterPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const hitPoint = new THREE.Vector3();
+    const splashRings = [];
+
+    function spawnClickSplash(pos) {
+      const ringGeo = new THREE.RingGeometry(0.3, 0.55, 32);
+      ringGeo.rotateX(-Math.PI / 2);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: 0x88e2ff,
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      });
+      const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+      ringMesh.position.set(pos.x, 0.08, pos.z);
+      scene.add(ringMesh);
+
+      splashRings.push({
+        mesh: ringMesh,
+        createdAt: performance.now() * 0.001
+      });
+    }
+
+    function onPointerDown(event) {
+      // Only primary left clicks for water waves (allow right click for orbit)
+      if (event.button !== 0) return;
+
+      mouseNDC.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouseNDC.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouseNDC, camera);
+      const hit = raycaster.ray.intersectPlane(waterPlane, hitPoint);
+
+      if (hit) {
+        const currentTime = performance.now() * 0.001;
+        clickData[clickIndex] = {
+          x: hitPoint.x,
+          z: hitPoint.z,
+          time: currentTime,
+          amp: 0.95
+        };
+        clickIndex = (clickIndex + 1) % MAX_CLICKS;
+
+        // Visual feedback
+        spawnClickSplash(hitPoint);
+      }
+    }
+    // --- 4-Point Buoyancy Boat Physics Engine with Lead Keel Ballast ---
+    const boatPhysics = {
+      pos: new THREE.Vector3(0, 0, 0),
+      vel: new THREE.Vector3(0, 0, 0),
+      rot: new THREE.Euler(0, 0, 0, 'YXZ'),
+      angularVel: new THREE.Vector3(0, 0, 0),
+      mass: 220.0, // Added mass including lead keel ballast
+      width: 2.2,
+      length: 4.0,
+      headingAngle: 0.0,   // Boat yaw orientation in radians
+      throttle: 0.0,       // Current motor drive power
+      rudder: 0.0          // Rudder deflection
+    };
+
+    // Stern foam trail meshes
+    const wakeFoamRings = [];
+    let lastWakeSpawnTime = 0;
+
+    function spawnWakeParticle(pos, boatHeading, speedRatio) {
+      const wakeGeo = new THREE.PlaneGeometry(1.2, 0.7);
+      wakeGeo.rotateX(-Math.PI / 2);
+      const wakeMat = new THREE.MeshBasicMaterial({
+        color: 0xcbe7ff,
+        transparent: true,
+        opacity: Math.min(0.75, 0.35 + speedRatio * 0.4),
+        side: THREE.DoubleSide,
+        depthWrite: false
+      });
+      const mesh = new THREE.Mesh(wakeGeo, wakeMat);
+      mesh.position.copy(pos);
+      mesh.rotation.y = boatHeading;
+      scene.add(mesh);
+
+      wakeFoamRings.push({
+        mesh: mesh,
+        createdAt: performance.now() * 0.001,
+        initialScale: 0.9 + speedRatio * 0.6
+      });
+    }
+
+    function updateBoatPhysics(dt, time) {
+      // --- 1. WASD Input Processing & Engine Propulsion ---
+      const forwardDir = new THREE.Vector3(0, 0, 1).applyQuaternion(boatGroup.quaternion);
+      forwardDir.y = 0;
+      forwardDir.normalize();
+
+      const rightDir = new THREE.Vector3(1, 0, 0).applyQuaternion(boatGroup.quaternion);
+      rightDir.y = 0;
+      rightDir.normalize();
+
+      // Throttle acceleration (W / S)
+      let targetThrottle = 0.0;
+      if (keys.w) targetThrottle += 1.0;
+      if (keys.s) targetThrottle -= 0.45;
+      boatPhysics.throttle = THREE.MathUtils.lerp(boatPhysics.throttle, targetThrottle, dt * 3.5);
+
+      // Rudder steering (A / D)
+      let targetRudder = 0.0;
+      if (keys.a) targetRudder += 1.0;
+      if (keys.d) targetRudder -= 1.0;
+      boatPhysics.rudder = THREE.MathUtils.lerp(boatPhysics.rudder, targetRudder, dt * 5.0);
+
+      // Engine thrust force in forward vector
+      const engineThrustPower = 3400.0;
+      const thrustForce = forwardDir.clone().multiplyScalar(boatPhysics.throttle * engineThrustPower);
+
+      // Rudder torque (turning yaw depends on forward velocity through water)
+      const boatForwardSpeed = boatPhysics.vel.dot(forwardDir);
+      const rudderTorquePower = 480.0;
+      const effectiveTurning = boatPhysics.rudder * (0.35 + Math.abs(boatForwardSpeed) * 0.65);
+      const yawTorque = new THREE.Vector3(0, effectiveTurning * rudderTorquePower, 0);
+
+      // --- 2. Wake Wave Generation at the Stern ---
+      const absSpeed = Math.abs(boatForwardSpeed);
+      if (absSpeed > 0.4 && (time - lastWakeSpawnTime) > 0.22) {
+        lastWakeSpawnTime = time;
+        // Stern position (back of the boat)
+        const sternLocal = new THREE.Vector3(0, -0.1, -boatPhysics.length * 0.48);
+        const sternWorld = sternLocal.applyQuaternion(boatGroup.quaternion).add(boatPhysics.pos);
+
+        // Add to analytical wake heightfield
+        wakeData[wakeIndex] = {
+          x: sternWorld.x,
+          z: sternWorld.z,
+          time: time,
+          amp: Math.min(0.45, absSpeed * 0.09)
+        };
+        wakeIndex = (wakeIndex + 1) % MAX_WAKES;
+
+        // Visual foam wake patch
+        spawnWakeParticle(sternWorld, boatGroup.rotation.y, Math.min(1.0, absSpeed / 5.0));
+      }
+
+      // --- 3. 4-Point Hydrostatic Buoyancy & Keel Righting ---
+      const halfW = boatPhysics.width * 0.5;
+      const halfL = boatPhysics.length * 0.5;
+      const localProbes = [
+        new THREE.Vector3(-halfW, -0.35, -halfL), // Back-Left
+        new THREE.Vector3(halfW, -0.35, -halfL),  // Back-Right
+        new THREE.Vector3(-halfW, -0.35, halfL),  // Front-Left
+        new THREE.Vector3(halfW, -0.35, halfL)   // Front-Right
+      ];
+
+      const currentQuat = boatGroup.quaternion;
+      let totalBuoyancyForce = new THREE.Vector3(0, 0, 0);
+      let totalTorque = new THREE.Vector3(0, 0, 0).add(yawTorque);
+      const gravityForce = new THREE.Vector3(0, -9.81 * boatPhysics.mass, 0);
+
+      localProbes.forEach(probeLocal => {
+        const worldPos = probeLocal.clone().applyQuaternion(currentQuat).add(boatPhysics.pos);
+        const waterHeight = getWaterHeightAt(worldPos.x, worldPos.z, time);
+        const submersion = waterHeight - worldPos.y;
+
+        if (submersion > 0) {
+          const kBuoy = 2500.0;
+          const pointVelocityY = boatPhysics.vel.y + boatPhysics.angularVel.x * probeLocal.z;
+          const damping = 180.0 * pointVelocityY;
+          const forceY = Math.max(0, submersion * kBuoy - damping);
+          const forceVec = new THREE.Vector3(0, forceY, 0);
+
+          totalBuoyancyForce.add(forceVec);
+
+          // Torque: r x F
+          const arm = probeLocal.clone().applyQuaternion(currentQuat);
+          const torque = arm.clone().cross(forceVec);
+          totalTorque.add(torque);
+        }
+      });
+
+      // BLEIKIEL: Hydrostatic righting torque
+      const upVec = new THREE.Vector3(0, 1, 0);
+      const boatUp = new THREE.Vector3(0, 1, 0).applyQuaternion(currentQuat);
+      const tiltAxis = new THREE.Vector3().crossVectors(boatUp, upVec);
+      const tiltAngle = Math.asin(Math.min(1.0, Math.max(-1.0, tiltAxis.length())));
+
+      if (tiltAxis.lengthSq() > 0.0001) {
+        tiltAxis.normalize();
+        const keelRightingPower = 720.0;
+        const rightingTorque = tiltAxis.multiplyScalar(tiltAngle * keelRightingPower);
+        totalTorque.add(rightingTorque);
+      }
+
+      // Linear forces & acceleration
+      const netForce = new THREE.Vector3()
+        .add(gravityForce)
+        .add(totalBuoyancyForce)
+        .add(thrustForce);
+
+      const accel = netForce.divideScalar(boatPhysics.mass);
+
+      // Water hull friction: low drag along forward keel, higher drag sideways (drift resist)
+      const lateralVel = rightDir.clone().multiplyScalar(boatPhysics.vel.dot(rightDir));
+      const longitudinalVel = forwardDir.clone().multiplyScalar(boatPhysics.vel.dot(forwardDir));
+      accel.addScaledVector(longitudinalVel, -0.65);
+      accel.addScaledVector(lateralVel, -3.2);
+      accel.y -= boatPhysics.vel.y * 1.8;
+
+      boatPhysics.vel.addScaledVector(accel, dt);
+      boatPhysics.pos.addScaledVector(boatPhysics.vel, dt);
+
+      // Angular dynamics
+      const momentInertia = 160.0;
+      const angAccel = totalTorque.divideScalar(momentInertia);
+      angAccel.addScaledVector(boatPhysics.angularVel, -3.9);
+      boatPhysics.angularVel.addScaledVector(angAccel, dt);
+
+      // Integrate orientation via quaternion delta
+      const angSpeed = boatPhysics.angularVel.length();
+      if (angSpeed > 0.00001) {
+        const deltaRotation = new THREE.Quaternion().setFromAxisAngle(
+          boatPhysics.angularVel.clone().normalize(),
+          angSpeed * dt
+        );
+        boatGroup.quaternion.multiplyQuaternions(deltaRotation, boatGroup.quaternion);
+      }
+
+      // Update Mesh Transform
+      boatGroup.position.copy(boatPhysics.pos);
+
+      // Orbit camera softly follows boat
+      controls.target.lerp(boatPhysics.pos, 0.06);
+
+      // Update speed on HUD (in knots: 1 m/s ~= 1.94 kn)
+      const knots = (boatPhysics.vel.length() * 1.94384).toFixed(1);
+      const speedEl = document.getElementById('boatSpeed');
+      if (speedEl) speedEl.innerText = `Speed: ${knots} kn`;
+    }
+
+    // --- Planar Reflector Camera Pass ---
+    const normalPlane = new THREE.Vector3(0, 1, 0);
+    const planeOffset = 0.0;
+
+    function renderPlanarReflection() {
+      // Mirror camera across Y=0 water plane
+      reflectorCamera.copy(camera);
+
+      // Invert vertical height and pitch
+      reflectorCamera.position.y = -camera.position.y + 2.0 * planeOffset;
+      const target = controls.target.clone();
+      target.y = -target.y + 2.0 * planeOffset;
+      reflectorCamera.lookAt(target);
+
+      // Hide water surfaces during reflection pass to avoid recursive rendering
+      oceanMesh.visible = false;
+      if (distantOuterOcean) distantOuterOcean.visible = false;
+
+      renderer.setRenderTarget(reflectionRenderTarget);
+      renderer.render(scene, reflectorCamera);
+      renderer.setRenderTarget(null);
+
+      oceanMesh.visible = true;
+      if (distantOuterOcean) distantOuterOcean.visible = true;
+    }
+
+    // --- Ocean Surface Deformation Update ---
+    function updateOceanMesh(time) {
+      // Keep ocean meshes locked with camera position horizontally (infinite illusion)
+      const snapX = Math.floor(camera.position.x / 2) * 2;
+      const snapZ = Math.floor(camera.position.z / 2) * 2;
+      oceanMesh.position.x = snapX;
+      oceanMesh.position.z = snapZ;
+
+      if (distantOuterOcean) {
+        distantOuterOcean.position.x = snapX;
+        distantOuterOcean.position.z = snapZ;
+      }
+
+      // 1. Center high-detail grid deformation
+      const posAttr = oceanGeometry.attributes.position;
+      const origPos = oceanPositionsOrig.array;
+      const currentPos = posAttr.array;
+      const vertexCount = posAttr.count;
+
+      const meshPosX = oceanMesh.position.x;
+      const meshPosZ = oceanMesh.position.z;
+
+      for (let i = 0; i < vertexCount; i++) {
+        const i3 = i * 3;
+        const gx = origPos[i3] + meshPosX;
+        const gz = origPos[i3 + 2] + meshPosZ;
+
+        const disp = getWaterDisplacement(gx, gz, time, false);
+
+        currentPos[i3] = disp.x - meshPosX;
+        currentPos[i3 + 1] = disp.y;
+        currentPos[i3 + 2] = disp.z - meshPosZ;
+      }
+      posAttr.needsUpdate = true;
+      oceanGeometry.computeVertexNormals();
+
+      // 2. Far Ocean Ring: Deform with the long oceanic swell waves all the way to 2400m
+      if (distantOuterOcean && outerPositionsOrig) {
+        const outerAttr = distantOuterOcean.geometry.attributes.position;
+        const oOrig = outerPositionsOrig.array;
+        const oCurr = outerAttr.array;
+        const oCount = outerAttr.count;
+
+        for (let j = 0; j < oCount; j++) {
+          const j3 = j * 3;
+          const ox = oOrig[j3] + meshPosX;
+          const oz = oOrig[j3 + 2] + meshPosZ;
+
+          const dispFar = getWaterDisplacement(ox, oz, time, true);
+          oCurr[j3 + 1] = dispFar.y;
+        }
+        outerAttr.needsUpdate = true;
+      }
+    }
+
+    // --- Animation & Render Loop ---
+    let prevTime = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      const dt = Math.min((now - prevTime) * 0.001, 0.05);
+      prevTime = now;
+      const time = now * 0.001;
+
+      // 1. Update stylized boat buoyancy physics
+      updateBoatPhysics(dt, time);
+
+      // 2. Fade splash rings & boat wake foam
+      for (let i = splashRings.length - 1; i >= 0; i--) {
+        const splash = splashRings[i];
+        const age = time - splash.createdAt;
+        if (age > 1.2) {
+          scene.remove(splash.mesh);
+          splash.mesh.geometry.dispose();
+          splash.mesh.material.dispose();
+          splashRings.splice(i, 1);
+        } else {
+          const scale = 1.0 + age * 2.8;
+          splash.mesh.scale.set(scale, scale, scale);
+          splash.mesh.material.opacity = (1.0 - (age / 1.2)) * 0.8;
+        }
+      }
+
+      for (let i = wakeFoamRings.length - 1; i >= 0; i--) {
+        const wake = wakeFoamRings[i];
+        const age = time - wake.createdAt;
+        if (age > 3.6) {
+          scene.remove(wake.mesh);
+          wake.mesh.geometry.dispose();
+          wake.mesh.material.dispose();
+          wakeFoamRings.splice(i, 1);
+        } else {
+          const progress = age / 3.6;
+          const scaleX = wake.initialScale * (1.0 + progress * 4.2);
+          const scaleZ = wake.initialScale * (1.0 + progress * 2.2);
+          wake.mesh.scale.set(scaleX, 1.0, scaleZ);
+          wake.mesh.material.opacity = (1.0 - progress) * 0.55;
+        }
+      }
+
+      // Update HUD active wave count
+      let activeWaves = 0;
+      clickData.forEach(c => {
+        if (time - c.time < 12.0) activeWaves++;
+      });
+      document.getElementById('waveCounter').innerText = `Wellen aktiv: ${activeWaves}`;
+
+      // 3. Update Dynamic Ocean Surface
+      updateOceanMesh(time);
+
+      // 4. Update Controls
+      controls.update();
+
+      // 5. Planar Reflection Pass (Renders boat and sky from water plane mirror)
+      renderPlanarReflection();
+
+      // 6. Main Scene WebGPU Render
+      renderer.render(scene, camera);
+    }
+
+    // Responsive Canvas Resize
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      reflectorCamera.aspect = camera.aspect;
+      reflectorCamera.updateProjectionMatrix();
+
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      reflectionRenderTarget.setSize(
+        Math.floor(window.innerWidth / 2),
+        Math.floor(window.innerHeight / 2)
+      );
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
