@@ -64,10 +64,16 @@ export function createOcean(uniforms: Record<string, THREE.IUniform>) {
       varying float vDepth;
 
       vec3 sky(vec3 d){ return textureLod(tSkyCube, d, 0.0).rgb; }
-      float rip(vec2 p){
-        return vnoise(p * 0.55 + uTime * vec2(0.35, 0.12)) * 0.11
-             + vnoise(mat2(0.8, -0.6, 0.6, 0.8) * p * 1.3 - uTime * vec2(0.1, 0.5)) * 0.05
-             + vnoise(mat2(0.3, 0.95, -0.95, 0.3) * p * 3.1 + uTime * vec2(0.6, -0.3)) * 0.02;
+      // per-octave slope: cheap analytic-ish gradient via finite differences, faded by pixel footprint
+      float rip(vec2 p, float fw){
+        // slowly varying warp bends the stripes of the geometric waves
+        vec2 wp = p + 2.2 * vec2(vnoise(p * 0.06 + 3.0), vnoise(p * 0.06 - 5.0)) - 1.1;
+        float h = vnoise(wp * 0.18 + uTime * vec2(0.05, 0.02)) * 0.5;
+        h += vnoise(wp * 0.55 + uTime * vec2(0.35, 0.12)) * 0.11 * (1.0 - smoothstep(0.0, 0.9, fw * 0.55));
+        h += vnoise(mat2(0.8, -0.6, 0.6, 0.8) * wp * 1.3 - uTime * vec2(0.1, 0.5)) * 0.05 * (1.0 - smoothstep(0.0, 0.9, fw * 1.3));
+        h += vnoise(mat2(0.3, 0.95, -0.95, 0.3) * wp * 3.1 + uTime * vec2(0.6, -0.3)) * 0.022 * (1.0 - smoothstep(0.0, 0.9, fw * 3.1));
+        h += vnoise(mat2(0.6, 0.8, -0.8, 0.6) * wp * 7.3 + uTime * vec2(-0.5, 0.8)) * 0.009 * (1.0 - smoothstep(0.0, 0.9, fw * 7.3));
+        return h;
       }
 
       // cellular noise → (F1, F2): foam gathers on the cell borders like real sea foam lace
@@ -120,17 +126,16 @@ export function createOcean(uniforms: Record<string, THREE.IUniform>) {
           N = normalize(N + vec3(-hx, 0.0, -hz) / (2.0 * uWakeTexel) * 1.6);
         }
 
-        // detail waves: two octaves of the animated slope map
-        float dfade = 1.0 - smoothstep(15.0, 250.0, dist);
-        // isotropic, non-repeating ripples: gradient of drifting value noise (3 octaves)
-        vec2 sl = vec2(0.0);
-        if (dfade > 0.0) {
+        // detail ripples: isotropic gradient noise, octaves fade by pixel footprint instead of a hard distance cutoff
+        float fw = max(length(dFdx(vBase)), length(dFdy(vBase)));
+        vec2 sl;
+        {
           vec2 q = vBase;
-          const float E = 0.06;
-          float hc = rip(q);
-          sl = vec2(rip(q + vec2(E, 0.0)) - hc, rip(q + vec2(0.0, E)) - hc) / E;
+          const float E = 0.05;
+          float hc = rip(q, fw);
+          sl = vec2(rip(q + vec2(E, 0.0), fw) - hc, rip(q + vec2(0.0, E), fw) - hc) / E;
         }
-        sl *= (0.1 + 0.9 * dfade) * mix(0.3, 1.0, sqrt(max(V.y, 0.0)));
+        sl *= mix(0.25, 1.0, sqrt(max(V.y, 0.0))) * (1.0 - 0.5 * smoothstep(300.0, 3000.0, dist));
         N = normalize(N + vec3(-sl.x, 0.0, -sl.y));
         N = normalize(mix(N, vec3(0.0, 1.0, 0.0), smoothstep(400.0, 5000.0, dist) * 0.6));
 

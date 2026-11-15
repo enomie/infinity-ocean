@@ -12,14 +12,15 @@ const SPEC: [number, number, number, number][] = (() => {
   const out: [number, number, number, number][] = [];
   let seed = 9001;
   const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  const N = 16;
+  const N = 20;
   for (let i = 0; i < N; i++) {
     const L = 140 * Math.pow(2.4 / 140, i / (N - 1)) * (0.93 + rnd() * 0.14);
-    const spread = 0.35 + 0.9 * (i / (N - 1));
-    const dir = WIND + (rnd() * 2 - 1) * spread;
+    const spread = 0.6 + 0.9 * (i / (N - 1));
+    // every 5th wave belongs to a crossing swell system → no single dominant stripe direction
+    const dir = WIND + (i % 5 === 2 ? 1.1 : 0) + (rnd() * 2 - 1) * spread;
     // steepness peaks in the mid band (wind sea), long swell is gentle
     const steep = 0.028 + 0.02 * Math.sin(Math.PI * Math.min(i / (N * 0.7), 1));
-    out.push([dir, (steep * L) / (2 * Math.PI) * 1.1, L, rnd() * 6.283]);
+    out.push([dir, (steep * L) / (2 * Math.PI) * 1.1 * (0.8 + rnd() * 0.4), L, rnd() * 6.283]);
   }
   return out;
 })();
